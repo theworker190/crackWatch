@@ -12,7 +12,6 @@ from torchvision import transforms
 from torchvision.models import mobilenet_v3_small
 import matplotlib.pyplot as plt
 
-# Make sure we can import local modules when script is run from project root
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -74,32 +73,49 @@ def extract_skeleton_features(mask):
     return length_px, avg_width_px, max_width_px, n_branches, skeleton
 
 
-def classify_severity_geometry(length_px, avg_width_px, max_width_px, n_branches, image_width):
+def classify_severity_geometry(length_px, avg_width_px, max_width_px, n_branches, image_width, mask_area_px, max_area, max_length, max_width, max_branches):
     """
-    Classify crack severity based on detailed geometry features.
-    Returns: severity level string
+    Classify crack severity using weighted formula:
+    Severity = α*A_n + β*L_n + γ*W_n + δ*B_n
+    
+    Where normalized values are calculated as:
+    A_n = Area / max_Area
+    L_n = Length / max_Length  
+    W_n = Width / max_Width
+    B_n = Branches / max_Branches
+    
+    Weights (example): α=0.3, β=0.3, γ=0.3, δ=0.1
+    
+    Severity ranges:
+    0.0-0.3 → Minor
+    0.3-0.6 → Moderate
+    0.6-1.0 → Severe
+    
+    Returns: (severity_score, severity_level)
     """
-    # CRITICAL: Very wide or highly branched (check first for most severe)
-    if (avg_width_px >= 12 or max_width_px >= 22 or n_branches >= 5):
-        return "CRITICAL"
+    alpha = 0.3  # area weight
+    beta = 0.3   # length weight
+    gamma = 0.3  # width weight
+    delta = 0.1  # branching weight
     
-    # HIGH: Wide, long, or branching cracks
-    elif (avg_width_px >= 7 or max_width_px >= 15 or n_branches >= 3):
-        return "HIGH"
+    # Normalize measurements (avoid division by zero)
+    A_n = mask_area_px / max(max_area, 1)
+    L_n = length_px / max(max_length, 1)
+    W_n = max_width_px / max(max_width, 1)
+    B_n = n_branches / max(max_branches, 1)
     
-    # MODERATE: Medium cracks
-    elif ((4 <= avg_width_px < 7) or (8 <= max_width_px < 15) or 
-          (0.6 * image_width <= length_px < 0.9 * image_width)):
-        return "MODERATE"
+    # Calculate severity score
+    severity_score = alpha * A_n + beta * L_n + gamma * W_n + delta * B_n
     
-    # LOW: Thin, short, simple cracks
-    elif (avg_width_px < 4 and max_width_px < 8 and 
-          length_px < 0.6 * image_width and n_branches <= 1):
-        return "LOW"
-    
-    # Default to MODERATE if doesn't clearly fit other categories
+    # Map to severity classes
+    if severity_score < 0.3:
+        severity_level = "Minor"
+    elif severity_score < 0.6:
+        severity_level = "Moderate"
     else:
-        return "MODERATE"
+        severity_level = "Severe"
+    
+    return severity_score, severity_level
 
 
 def load_segmentation_model(path, device):
@@ -119,8 +135,6 @@ def load_segmentation_model(path, device):
 
 
 def build_classification_model(device):
-    # instantiate same architecture used during training
-    # Must match classification.py exactly: classifier[3] is replaced
     from torchvision.models import MobileNet_V3_Small_Weights
     model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
     
@@ -176,8 +190,6 @@ def run_on_image(img_path, seg_model, cls_model, device, threshold=0.5, class_th
         cls_out = cls_model(cls_in).squeeze(1)
         prob = torch.sigmoid(cls_out).cpu().item()
     
-    # ImageFolder assigns: crack=0, no_crack=1
-    # So prob close to 1 means no_crack, prob close to 0 means crack
     has_crack = prob < 0.5
     crack_confidence = 1 - prob  # confidence that it's a crack
     
@@ -222,9 +234,20 @@ def run_on_image(img_path, seg_model, cls_model, device, threshold=0.5, class_th
             
             # Extract detailed geometry features
             length_px, avg_width_px, max_width_px, n_branches, skeleton = extract_skeleton_features(mask_arr)
-            severity = classify_severity_geometry(length_px, avg_width_px, max_width_px, n_branches, orig_size[0])
             
-            # Create skeleton visualization (yellow on original image)
+            # Calculate mask area
+            mask_area_px = crack_pixels.sum()
+            
+            max_area = orig_size[0] * orig_size[1] * 0.5  
+            max_length = orig_size[0] * 1.5  
+            max_width = 50  
+            max_branches = 20  
+            
+            severity_score, severity = classify_severity_geometry(
+                length_px, avg_width_px, max_width_px, n_branches, 
+                orig_size[0], mask_area_px, max_area, max_length, max_width, max_branches
+            )
+            
             skeleton_arr = img_arr.copy()
             skeleton_pixels = skeleton > 0
             skeleton_arr[skeleton_pixels] = [255, 255, 0]  # Yellow for skeleton
@@ -240,11 +263,13 @@ def run_on_image(img_path, seg_model, cls_model, device, threshold=0.5, class_th
             skeleton_img = skeleton_arr
             
             print(f"\n  Crack Geometry Analysis:")
+            print(f"    Area: {mask_area_px} pixels")
             print(f"    Length: {length_px} pixels ({length_px/orig_size[0]:.2f}x image width)")
             print(f"    Average width: {avg_width_px:.2f} pixels")
             print(f"    Maximum width: {max_width_px:.2f} pixels")
             print(f"    Branch points: {n_branches}")
-            print(f"    Severity: {severity}")
+            print(f"    Severity Score: {severity_score:.3f}")
+            print(f"    Severity Level: {severity}")
         
         overlay_img = overlay_arr
     else:
@@ -292,10 +317,11 @@ def main():
         print(f'Image not found: {img_path}')
         return
 
-    has_crack, crack_confidence, overlay_img, skeleton_img, original_img, severity = run_on_image(
+    result = run_on_image(
         img_path, seg_model, cls_model, device, 
         threshold=args.threshold, class_threshold=args.class_threshold
     )
+    has_crack, crack_confidence, overlay_img, skeleton_img, original_img, severity = result
 
     # Display result
     if has_crack and overlay_img is not None:
@@ -313,7 +339,11 @@ def main():
         axes[2].imshow(skeleton_img)
         title = 'Skeleton (Yellow)'
         if severity:
-            title += f'\n\nSeverity: {severity}'
+            if isinstance(severity, tuple):
+                score, level = severity
+                title += f'\n\nSeverity: {level} ({score:.3f})'
+            else:
+                title += f'\n\nSeverity: {severity}'
         axes[2].set_title(title, fontsize=12, fontweight='bold')
         axes[2].axis('off')
         
